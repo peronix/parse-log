@@ -1,4 +1,6 @@
 <?php
+require_once 'vendor/autoload.php';
+use GeoIp2\Database\Reader;
 
 date_default_timezone_set('America/Los_Angeles');
 
@@ -8,7 +10,7 @@ $stats = array();
 $unique_ips = array();
 $session_dates = array();
 
-$log_regex = '/^(\S+) (\S+) (\S+) \[([^:]+:\d+:\d+:\d+ [^\]]+)\] \"(\S+) (.*?) (\S+)\" (\S+) (\S+) "([^"]*)" "([^"]*)"$/';
+$log_regex = '/^(\S+) (\S+) (\S+) (\S+) \[([^:]+:\d+:\d+:\d+ [^\]]+)\] \"(\S+) (.*?) (\S+)\" (\S+) (\S+) "([^"]*)" "([^"]*)"$/';
 $tablet_regex = '/(tablet|ipad|playbook)|(android(?!.*(mobi|opera mini)))/i';
 $mobile_regex = '/(up.browser|up.link|mmp|symbian|smartphone|midp|wap|phone|android|iemobile)/i';
 $mobile_agents = array(
@@ -28,30 +30,30 @@ if (($handle = fopen("http.log", "r")) !== FALSE) {
 			continue;
 		}
 		$log = array(
-			'REMOTEADDR' => $matches[1],
-			'SESSION' => $matches[2],
-			'USERNAME' => $matches[3],
-			'DATETIME' => $matches[4],
-			'METHOD' => $matches[5],
-			'REQUESTURI' => $matches[6],
-			'PROTO' => $matches[7],
-			'STATUSCODE' => $matches[8],
-			'SIZE' => $matches[9],
-			'REFERRER' => $matches[10],
-			'USERAGENT' => $matches[11],
+			'REMOTEADDR' => $matches[2],
+			'SESSION' => $matches[3],
+			'USERNAME' => $matches[4],
+			'DATETIME' => $matches[5],
+			'METHOD' => $matches[6],
+			'REQUESTURI' => $matches[7],
+			'PROTO' => $matches[8],
+			'STATUSCODE' => $matches[9],
+			'SIZE' => $matches[10],
+			'REFERRER' => $matches[11],
+			'USERAGENT' => $matches[12],
 		);
-		
-		$path = $log['REQUESTURI'];
-		$path_parts = explode('/', trim($path, '/'));
-		$request = $path_parts[0];
 
-		if($request != 'form' && $request != 'register'){
+		$request = trim($log['REQUESTURI'], '/');
+
+		if(strlen($log['SESSION']) < 32 || (substr($request, 0, 2) != 'bs' && substr($request, 0, 8) != 'register')){
 			continue;
 		}
 
-		$form_path = $path_parts[1].'/'.$path_parts[2];
+		$ref = parse_url($log['REFERRER']);
+		$host = implode('.', array_slice(explode('.', $ref['host']), 0, 3));
+		$form_path = $host.$ref['path'];
 
-		if($request == 'form' && $log['STATUSCODE'] == 200){
+		if(substr($request, 0, 2) == 'bs' && $log['STATUSCODE'] == 200){
 			$tablet_browser = 0;
 			$mobile_browser = 0;
 			$browser_type = 'desktop';
@@ -78,20 +80,32 @@ if (($handle = fopen("http.log", "r")) !== FALSE) {
 				? $stats[$form_path]['page_views']+1 : 1;
 			$stats[$form_path][$browser_type.'_clients'] = isset($stats[$form_path][$browser_type.'_clients'])
 				? $stats[$form_path][$browser_type.'_clients']+1 : 1;
-			$stats[$form_path]['referral_sources'][$log['REFERRER']] = isset($stats[$form_path]['referral_sources'][$log['REFERRER']]) 
-				? $stats[$form_path]['referral_sources'][$log['REFERRER']]+1 : 1;
-			$unique_ips[$form_path][$log['REMOTEADDR']] = isset($unique_ips[$form_path][$log['REMOTEADDR']])
-				? $unique_ips[$form_path][$log['REMOTEADDR']] : 0;
+			// $stats[$form_path]['referral_sources'][$log['REFERRER']] = isset($stats[$form_path]['referral_sources'][$log['REFERRER']]) 
+			// 	? $stats[$form_path]['referral_sources'][$log['REFERRER']]+1 : 1;
 			$session_dates[$form_path][$log['SESSION']]['start'] = $time;
 			if(empty($stats[$form_path]['log_start']) || $stats[$form_path]['log_start'] > $time)
 				$stats[$form_path]['log_start'] = $time;
 			if(empty($stats[$form_path]['log_end']) || $stats[$form_path]['log_end'] < $time)
 				$stats[$form_path]['log_end'] = $time;
+			if(empty($unique_ips[$form_path][$log['REMOTEADDR']])){
+				$unique_ips[$form_path][$log['REMOTEADDR']] = array(
+					'views' => 1,
+					'transactions' => 0
+				);
+			}else{
+				$unique_ips[$form_path][$log['REMOTEADDR']]['views'] += 1;
+			}
 		}else
-		if($request == 'register' && $log['STATUSCODE'] == 200) {
+		if(substr($request, 0, 8) == 'register' && $log['STATUSCODE'] == 200) {
 			$session_dates[$form_path][$log['SESSION']]['end'] = strtotime($log['DATETIME']);
-			$unique_ips[$form_path][$log['REMOTEADDR']] = isset($unique_ips[$form_path][$log['REMOTEADDR']])
-				? $unique_ips[$form_path][$log['REMOTEADDR']]+1 : 1;
+			if(empty($unique_ips[$form_path][$log['REMOTEADDR']])){
+				$unique_ips[$form_path][$log['REMOTEADDR']] = array(
+					'views' => 0,
+					'transactions' => 1
+				);
+			}else{
+				$unique_ips[$form_path][$log['REMOTEADDR']]['transactions'] += 1;
+			}
 		}
 	}
 
@@ -108,22 +122,41 @@ if (($handle = fopen("http.log", "r")) !== FALSE) {
 			}
 		}
 	}
+	$reader = new Reader('GeoLite2-City.mmdb');
 	foreach($unique_ips as $form_path => $x){
 		$stats[$form_path]['unique_visitors'] = count($x);
 		foreach($x as $ip => $y){
-			if($y){
+			$record = $reader->city($ip);
+			$location = $record->country->isoCode
+				.'-'.$record->mostSpecificSubdivision->isoCode
+				.'-'.$record->postal->code;
+			if(empty($stats[$form_path]['map'][$location])){
+				$stats[$form_path]['map'][$location] = array(
+					'views' => $y['views'],
+					'transactions' => $y['transactions'],
+					'lat' => $record->location->latitude,
+					'lng' => $record->location->longitude
+				);
+			}else{
+				$stats[$form_path]['map'][$location]['views'] += $y['views'];
+				$stats[$form_path]['map'][$location]['transactions'] += $y['transactions'];
+			}
+			if($y['transactions']){
 				$stats[$form_path]['conversions'] = isset($stats[$form_path]['conversions'])
 					? $stats[$form_path]['conversions']+1 : 1;
 			}
 		}
 	}
-	
+
+	var_dump($stats);
+
 	$db = new PDO('mysql:host=localhost;dbname=webconnex', 'root', '');
 	$db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
 	$pub_sel = $db->prepare("select account_id, form_id from published where path = ?");
 	$stats_sel = $db->prepare("select * from form_stats where form_id = ?");
 	$ref_sel = $db->prepare("select * from form_stats_ref where form_id = ? and referrer = ?");
+	$map_sel = $db->prepare("select * from form_stats_map where form_id = ? and location = ?");
 
 	$stats_ins = $db->prepare("insert into form_stats (log_start, log_end, account_id, form_id, page_views, "
 		."desktop_clients, tablet_clients, mobile_clients, transactions, transaction_time, unique_visitors, conversions) "
@@ -136,6 +169,10 @@ if (($handle = fopen("http.log", "r")) !== FALSE) {
 
 	$ref_ins = $db->prepare("insert into form_stats_ref (account_id, form_id, referrer, count) VALUES (:account_id, :form_id, :referrer, :count)");
 	$ref_upd = $db->prepare("update form_stats_ref set count = :count where id = :id");
+
+	$map_ins = $db->prepare("insert into form_stats_map (account_id, form_id, location, lat, lng, views, transactions) "
+		."VALUES (:account_id, :form_id, :location, :lat, :lng, :views, :transactions)");
+	$map_upd = $db->prepare("update form_stats_map set views = :views, transactions = :transactions where id = :id");
 
 	foreach($stats as $form_path => $data){
 		$form_path = 'sota.givingfuel.com/mobile-giving-form';
@@ -178,24 +215,47 @@ if (($handle = fopen("http.log", "r")) !== FALSE) {
 			);
 			$stats_upd->execute($stats_data);
 		}
-		foreach($data['referral_sources'] as $ref => $count){
-			$ref_sel->execute(array($pub_row['form_id'],$ref));
-			$ref_row = $ref_sel->fetch();
-			if(empty($ref_row)){
-				$ref_data = array(
+		foreach($data['map'] as $location => $location_data){
+			$map_sel->execute(array($pub_row['form_id'], $location));
+			$map_row = $map_sel->fetch();
+			if(empty($map_row)){
+				$map_data = array(
 					':account_id' => $pub_row['account_id'],
 					':form_id' => $pub_row['form_id'],
-					':referrer' => $ref,
-					':count' => $count
+					':location' => $location,
+					':lat' => $location_data['lat'],
+					':lng' => $location_data['lng'],
+					':views' => $location_data['views'],
+					':transactions' => $location_data['transactions']
 				);
-				$ref_ins->execute($ref_data);
+				$map_ins->execute($map_data);
 			}else{
-				$ref_data = array(
-					':count' => $ref_row['count']+$count,
-					':id' => (int)$ref_row['id'],
+				$map_data = array(
+					':views' => $map_row['views']+$location_data['views'],
+					':transactions' => $map_row['transactions']+$location_data['transactions'],
+					':id' => (int)$map_row['id']
 				);
-				$ref_upd->execute($ref_data);
+				$map_upd->execute($map_data);
 			}
 		}
+		// foreach($data['referral_sources'] as $ref => $count){
+		// 	$ref_sel->execute(array($pub_row['form_id'],$ref));
+		// 	$ref_row = $ref_sel->fetch();
+		// 	if(empty($ref_row)){
+		// 		$ref_data = array(
+		// 			':account_id' => $pub_row['account_id'],
+		// 			':form_id' => $pub_row['form_id'],
+		// 			':referrer' => $ref,
+		// 			':count' => $count
+		// 		);
+		// 		$ref_ins->execute($ref_data);
+		// 	}else{
+		// 		$ref_data = array(
+		// 			':count' => $ref_row['count']+$count,
+		// 			':id' => (int)$ref_row['id'],
+		// 		);
+		// 		$ref_upd->execute($ref_data);
+		// 	}
+		// }
 	}
 }

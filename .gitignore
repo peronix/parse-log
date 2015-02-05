@@ -1,0 +1,4 @@
+vendor/
+GeoLite2-City.mmdb
+composer.phar
+composer.lock
